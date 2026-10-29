@@ -1,0 +1,2 @@
+# Patch files preserve the exact upstream whitespace needed for clean application.
+patches/*.patch -whitespace

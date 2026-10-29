@@ -1,0 +1,24 @@
+[Unit]
+Description=GNOME Shell with independent monitor workspaces
+OnFailure=gnome-session-shutdown.target
+OnFailureJobMode=replace-irreversibly
+CollectMode=inactive-or-failed
+After=gnome-session-manager.target
+Requisite=gnome-session-initialized.target
+PartOf=gnome-session-initialized.target
+Before=gnome-session-initialized.target
+ConditionEnvironment=XDG_SESSION_TYPE=wayland
+
+[Service]
+Slice=session.slice
+Type=notify
+ExecStart=/opt/per-monitor-workspaces/usr/bin/gnome-shell
+Environment=GNOME_SHELL_SESSION_MODE=ubuntu
+Environment=GNOME_SHELL_DATADIR=/opt/per-monitor-workspaces/usr/share/gnome-shell
+Environment=GSETTINGS_SCHEMA_DIR=/opt/per-monitor-workspaces/usr/share/glib-2.0/schemas
+Environment=GI_TYPELIB_PATH=/opt/per-monitor-workspaces/usr/lib/@MULTIARCH@/mutter-14:/opt/per-monitor-workspaces/usr/lib/@MULTIARCH@/gnome-shell:/opt/per-monitor-workspaces/usr/lib/@MULTIARCH@/gnome-shell/girepository-1.0:/usr/lib/@MULTIARCH@/girepository-1.0
+Environment=LD_LIBRARY_PATH=/opt/per-monitor-workspaces/usr/lib/@MULTIARCH@:/opt/per-monitor-workspaces/usr/lib/@MULTIARCH@/mutter-14:/opt/per-monitor-workspaces/usr/lib/@MULTIARCH@/gnome-shell
+Environment=XDG_DATA_DIRS=/opt/per-monitor-workspaces/usr/share:%h/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share:/var/lib/snapd/desktop
+Restart=no
+TimeoutStopSec=5
+ExecStopPost=-/bin/sh -c 'systemctl --user unset-environment GNOME_SETUP_DISPLAY WAYLAND_DISPLAY DISPLAY XAUTHORITY'

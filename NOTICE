@@ -1,0 +1,4 @@
+This repository contains source patches against the upstream projects and
+revisions listed in patches/BASELINES.md. Mutter and GNOME Shell are GPL-2.0-or-later.
+The Smart Workspace Manager compatibility patch modifies an MIT-licensed
+upstream extension and retains that project's license when applied.

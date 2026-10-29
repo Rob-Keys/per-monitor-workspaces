@@ -1,0 +1,951 @@
+diff --git a/data/org.gnome.mutter.gschema.xml.in b/data/org.gnome.mutter.gschema.xml.in
+index 92c97b12e337b394fc81eeea451ec132f12dcbc1..8d6b60ece8e9416be6b1b1927e2d3f5315ef2e89 100644
+--- a/data/org.gnome.mutter.gschema.xml.in
++++ b/data/org.gnome.mutter.gschema.xml.in
+@@ -62,6 +62,16 @@
+       </description>
+     </key>
+ 
++    <key name="per-monitor-workspaces" type="b">
++      <default>false</default>
++      <summary>Enable per-monitor workspaces</summary>
++      <description>
++        If set to true, each monitor can display a different workspace independently.
++        Workspace switching will only affect the monitor where the cursor is located.
++        If set to false (default), all monitors switch workspaces together (traditional behavior).
++      </description>
++    </key>
++
+     <key name="focus-change-on-pointer-rest" type="b">
+       <default>false</default>
+       <summary>Delay focus changes until the pointer stops moving</summary>
+diff --git a/meson.build b/meson.build
+index 2adfe3351b88218434407af576326425b467c22c..2233b7a167f96f78d0155832fc721560abca8ae1 100644
+--- a/meson.build
++++ b/meson.build
+@@ -165,6 +165,7 @@ if have_x11_client
+   xrandr_dep = dependency('xrandr', version: xrandr_req)
+   xcb_randr_dep = dependency('xcb-randr')
+   xcb_res_dep = dependency('xcb-res')
++  xcb_util_dep = dependency('xcb-util')
+   xinerama_dep = dependency('xinerama')
+   xau_dep = dependency('xau')
+ endif
+diff --git a/src/core/meta-workspace-manager-private.h b/src/core/meta-workspace-manager-private.h
+index 0ecc6159bf80f0079eddddfde4e6836d4315fad8..97941e6db42a54c3c5b66c40530a7c589ffb7450 100644
+--- a/src/core/meta-workspace-manager-private.h
++++ b/src/core/meta-workspace-manager-private.h
+@@ -24,6 +24,7 @@
+ 
+ #include <glib.h>
+ 
++#include "backends/meta-logical-monitor.h"
+ #include "core/display-private.h"
+ #include "meta/common.h"
+ #include "meta/types.h"
+@@ -38,6 +39,10 @@ struct _MetaWorkspaceManager
+ 
+   GList *workspaces;
+ 
++  /* Per-monitor workspace tracking */
++  GHashTable *monitor_active_workspaces;  /* MetaLogicalMonitor* -> MetaWorkspace* */
++  int switch_monitor_index;
++
+   int rows_of_workspaces;
+   int columns_of_workspaces;
+   MetaDisplayCorner starting_corner;
+@@ -55,6 +60,20 @@ void meta_workspace_manager_update_workspace_layout (MetaWorkspaceManager *works
+ 
+ void meta_workspace_manager_reload_work_areas (MetaWorkspaceManager *workspace_manager);
+ 
++gboolean meta_workspace_manager_is_workspace_active (MetaWorkspaceManager *workspace_manager,
++                                                     MetaWorkspace        *workspace);
++
++void meta_workspace_manager_activate_workspace_for_monitor (MetaWorkspaceManager *workspace_manager,
++                                                            MetaWorkspace        *workspace,
++                                                            MetaLogicalMonitor   *monitor,
++                                                            guint32               timestamp);
++
++MetaWorkspace *meta_workspace_manager_get_active_workspace_for_monitor (MetaWorkspaceManager *workspace_manager,
++                                                                        MetaLogicalMonitor   *monitor);
++
++GList *meta_workspace_manager_get_monitors_for_workspace (MetaWorkspaceManager *workspace_manager,
++                                                          MetaWorkspace        *workspace);
++
+ typedef struct MetaWorkspaceLayout MetaWorkspaceLayout;
+ 
+ struct MetaWorkspaceLayout
+diff --git a/src/core/meta-workspace-manager.c b/src/core/meta-workspace-manager.c
+index 614fa96f344577b73e835c1e544afa848cffc07d..9970beeab425b54277b75d44b15d625a937b9c0b 100644
+--- a/src/core/meta-workspace-manager.c
++++ b/src/core/meta-workspace-manager.c
+@@ -28,8 +28,13 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
++#include "backends/meta-backend-private.h"
++#include "backends/meta-monitor-manager-private.h"
++#include "compositor/compositor-private.h"
+ #include "core/window-private.h"
+ #include "core/workspace-private.h"
++#include "meta/meta-backend.h"
++#include "meta/meta-context.h"
+ #include "meta/meta-enum-types.h"
+ #include "meta/prefs.h"
+ #include "meta/util.h"
+@@ -44,6 +49,7 @@ enum
+   WORKSPACES_REORDERED,
+   ACTIVE_WORKSPACE_CHANGED,
+   SHOWING_DESKTOP_CHANGED,
++  MONITOR_WORKSPACE_CHANGED,
+   LAST_SIGNAL
+ };
+ 
+@@ -62,6 +68,9 @@ static guint workspace_manager_signals [LAST_SIGNAL] = { 0 };
+ static void prefs_changed_callback (MetaPreference pref,
+                                     gpointer       data);
+ 
++static void on_monitors_changed (MetaMonitorManager   *monitor_manager,
++                                 MetaWorkspaceManager *workspace_manager);
++
+ static void meta_workspace_manager_init_workspaces (MetaWorkspaceManager *workspace_manager);
+ 
+ static void
+@@ -93,9 +102,21 @@ static void
+ meta_workspace_manager_finalize (GObject *object)
+ {
+   MetaWorkspaceManager *workspace_manager = META_WORKSPACE_MANAGER (object);
++  MetaContext *context;
++  MetaBackend *backend;
++  MetaMonitorManager *monitor_manager;
+ 
+   meta_prefs_remove_listener (prefs_changed_callback, workspace_manager);
+ 
++  /* Disconnect from monitor manager signals */
++  context = meta_display_get_context (workspace_manager->display);
++  backend = meta_context_get_backend (context);
++  monitor_manager = meta_backend_get_monitor_manager (backend);
++  g_signal_handlers_disconnect_by_data (monitor_manager, workspace_manager);
++
++  g_clear_pointer (&workspace_manager->monitor_active_workspaces,
++                   g_hash_table_destroy);
++
+   G_OBJECT_CLASS (meta_workspace_manager_parent_class)->finalize (object);
+ }
+ 
+@@ -165,6 +186,17 @@ meta_workspace_manager_class_init (MetaWorkspaceManagerClass *klass)
+                   0, NULL, NULL, NULL,
+                   G_TYPE_NONE, 0);
+ 
++  workspace_manager_signals[MONITOR_WORKSPACE_CHANGED] =
++    g_signal_new ("monitor-workspace-changed",
++                  G_TYPE_FROM_CLASS (klass),
++                  G_SIGNAL_RUN_LAST,
++                  0, NULL, NULL, NULL,
++                  G_TYPE_NONE,
++                  3,
++                  G_TYPE_POINTER,  /* MetaLogicalMonitor */
++                  META_TYPE_WORKSPACE,
++                  META_TYPE_WORKSPACE);
++
+   g_object_class_install_property (object_class,
+                                    PROP_LAYOUT_COLUMNS,
+                                    g_param_spec_int ("layout-columns", NULL, NULL,
+@@ -206,17 +238,30 @@ MetaWorkspaceManager *
+ meta_workspace_manager_new (MetaDisplay *display)
+ {
+   MetaWorkspaceManager *workspace_manager;
++  MetaContext *context;
++  MetaBackend *backend;
++  MetaMonitorManager *monitor_manager;
+ 
+   workspace_manager = g_object_new (META_TYPE_WORKSPACE_MANAGER, NULL);
+ 
+   workspace_manager->display = display;
+   workspace_manager->active_workspace = NULL;
+   workspace_manager->workspaces = NULL;
++  workspace_manager->monitor_active_workspaces =
++    g_hash_table_new_full (g_direct_hash, g_direct_equal, g_object_unref, NULL);
++  workspace_manager->switch_monitor_index = -1;
+   workspace_manager->rows_of_workspaces = 1;
+   workspace_manager->columns_of_workspaces = -1;
+   workspace_manager->vertical_workspaces = FALSE;
+   workspace_manager->starting_corner = META_DISPLAY_TOPLEFT;
+ 
++  /* Connect to monitor changes to handle hotplug */
++  context = meta_display_get_context (display);
++  backend = meta_context_get_backend (context);
++  monitor_manager = meta_backend_get_monitor_manager (backend);
++  g_signal_connect (monitor_manager, "monitors-changed",
++                   G_CALLBACK (on_monitors_changed), workspace_manager);
++
+   /* This is the default layout extracted from default
+    * variable values in update_num_workspaces ()
+    * This can be overridden using _NET_DESKTOP_LAYOUT in
+@@ -233,12 +278,75 @@ meta_workspace_manager_new (MetaDisplay *display)
+   meta_workspace_new (workspace_manager);
+ 
+   meta_workspace_manager_init_workspaces (workspace_manager);
++  on_monitors_changed (monitor_manager, workspace_manager);
+ 
+   meta_prefs_add_listener (prefs_changed_callback, workspace_manager);
+ 
+   return workspace_manager;
+ }
+ 
++static void
++on_monitors_changed (MetaMonitorManager   *monitor_manager,
++                    MetaWorkspaceManager *workspace_manager)
++{
++  GList *logical_monitors, *l;
++  GHashTableIter iter;
++  gpointer key, value;
++  g_autoptr (GHashTable) old_monitors = NULL;
++
++  logical_monitors = meta_monitor_manager_get_logical_monitors (monitor_manager);
++
++  /* Save current monitor->workspace mappings before clearing */
++  old_monitors = g_hash_table_new (g_direct_hash, g_direct_equal);
++  g_hash_table_iter_init (&iter, workspace_manager->monitor_active_workspaces);
++  while (g_hash_table_iter_next (&iter, &key, &value))
++    {
++      MetaLogicalMonitor *monitor = key;
++
++      g_hash_table_insert (old_monitors,
++                           GINT_TO_POINTER (monitor->number),
++                           value);
++    }
++
++  /* Clear old mappings - monitors may have been removed */
++  g_hash_table_remove_all (workspace_manager->monitor_active_workspaces);
++
++  /* Restore mappings for monitors that still exist */
++  for (l = logical_monitors; l; l = l->next)
++    {
++      MetaLogicalMonitor *monitor = l->data;
++      MetaWorkspace *workspace;
++
++      /* Try to restore previous workspace for this monitor */
++      workspace = g_hash_table_lookup (old_monitors,
++                                       GINT_TO_POINTER (monitor->number));
++
++      if (!workspace)
++        {
++          /* New monitor - use the primary monitor's active workspace */
++          MetaLogicalMonitor *primary =
++            meta_monitor_manager_get_primary_logical_monitor (monitor_manager);
++          if (primary)
++            workspace = g_hash_table_lookup (old_monitors,
++                                             GINT_TO_POINTER (primary->number));
++          if (!workspace)
++            workspace = workspace_manager->active_workspace;
++        }
++
++      if (workspace)
++        {
++          g_hash_table_replace (workspace_manager->monitor_active_workspaces,
++                                g_object_ref (monitor),
++                                workspace);
++        }
++    }
++
++  /* Update work areas after monitor configuration changes */
++  meta_workspace_manager_reload_work_areas (workspace_manager);
++  for (l = workspace_manager->workspaces; l; l = l->next)
++    meta_workspace_queue_calc_showing (l->data);
++}
++
+ void
+ meta_workspace_manager_init_workspaces (MetaWorkspaceManager *workspace_manager)
+ {
+@@ -317,7 +425,45 @@ meta_workspace_manager_remove_workspace (MetaWorkspaceManager *workspace_manager
+   meta_workspace_relocate_windows (workspace, neighbour);
+ 
+   if (workspace == workspace_manager->active_workspace)
+-    meta_workspace_activate (neighbour, timestamp);
++    {
++      if (meta_prefs_get_per_monitor_workspaces ())
++        {
++          MetaContext *context = meta_display_get_context (workspace_manager->display);
++          MetaBackend *backend = meta_context_get_backend (context);
++          MetaMonitorManager *monitor_manager = meta_backend_get_monitor_manager (backend);
++          MetaLogicalMonitor *primary =
++            meta_monitor_manager_get_primary_logical_monitor (monitor_manager);
++
++          if (primary)
++            meta_workspace_manager_activate_workspace_for_monitor (workspace_manager,
++                                                                   neighbour,
++                                                                   primary,
++                                                                   timestamp);
++          else
++            meta_workspace_activate_with_focus (neighbour, NULL, timestamp);
++        }
++      else
++        {
++          meta_workspace_activate (neighbour, timestamp);
++        }
++    }
++
++  if (workspace_manager->monitor_active_workspaces)
++    {
++      GHashTableIter iter;
++      gpointer key, value;
++
++      g_hash_table_iter_init (&iter, workspace_manager->monitor_active_workspaces);
++      while (g_hash_table_iter_next (&iter, &key, &value))
++        {
++          if (value == workspace)
++            {
++              g_hash_table_iter_replace (&iter, neighbour);
++              g_object_notify (G_OBJECT (neighbour), "active");
++              meta_workspace_queue_calc_showing (neighbour);
++            }
++        }
++    }
+ 
+   /* To emit the signal after removing the workspace */
+   index = meta_workspace_index (workspace);
+@@ -438,15 +584,30 @@ meta_workspace_manager_update_num_workspaces (MetaWorkspaceManager *workspace_ma
+   for (l = extras; l; l = l->next)
+     {
+       MetaWorkspace *w = l->data;
++      GHashTableIter iter;
++      gpointer key, value;
+ 
+       meta_workspace_relocate_windows (w, last_remaining);
+ 
+       if (w == workspace_manager->active_workspace)
+         need_change_space = TRUE;
++
++      g_hash_table_iter_init (&iter,
++                              workspace_manager->monitor_active_workspaces);
++      while (g_hash_table_iter_next (&iter, &key, &value))
++        {
++          if (value == w)
++            {
++              g_hash_table_iter_replace (&iter, last_remaining);
++              g_object_notify (G_OBJECT (last_remaining), "active");
++              meta_workspace_queue_calc_showing (w);
++              meta_workspace_queue_calc_showing (last_remaining);
++            }
++        }
+     }
+ 
+   if (need_change_space)
+-    meta_workspace_activate (last_remaining, timestamp);
++    meta_workspace_activate_with_focus (last_remaining, NULL, timestamp);
+ 
+   /* Should now be safe to free the workspaces */
+   for (l = extras; l; l = l->next)
+@@ -1063,3 +1224,273 @@ meta_workspace_manager_get_layout_rows (MetaWorkspaceManager *workspace_manager)
+ 
+   return workspace_manager->rows_of_workspaces;
+ }
++
++/**
++ * meta_workspace_manager_activate_workspace_for_monitor:
++ * @workspace_manager: a #MetaWorkspaceManager
++ * @workspace: the #MetaWorkspace to activate
++ * @monitor: the #MetaLogicalMonitor to activate the workspace on
++ * @timestamp: timestamp for the activation
++ *
++ * Activates @workspace on the specified @monitor only.
++ * Other monitors remain on their current workspaces.
++ * This enables per-monitor independent workspace switching.
++ */
++void
++meta_workspace_manager_activate_workspace_for_monitor (MetaWorkspaceManager *workspace_manager,
++                                                       MetaWorkspace        *workspace,
++                                                       MetaLogicalMonitor   *monitor,
++                                                       guint32               timestamp)
++{
++  MetaWorkspace *old_workspace;
++  MetaWorkspace *old_global_workspace;
++  MetaContext *context;
++  MetaBackend *backend;
++  MetaMonitorManager *monitor_manager;
++  MetaLogicalMonitor *primary_monitor;
++  gboolean old_workspace_was_active;
++  gboolean workspace_was_active;
++  gboolean old_global_workspace_was_active;
++
++  g_return_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager));
++  g_return_if_fail (META_IS_WORKSPACE (workspace));
++  g_return_if_fail (monitor != NULL);
++
++  old_workspace = g_hash_table_lookup (workspace_manager->monitor_active_workspaces,
++                                       monitor);
++  old_global_workspace = workspace_manager->active_workspace;
++
++  old_workspace_was_active = old_workspace &&
++    meta_workspace_manager_is_workspace_active (workspace_manager, old_workspace);
++  workspace_was_active =
++    meta_workspace_manager_is_workspace_active (workspace_manager, workspace);
++  old_global_workspace_was_active = old_global_workspace &&
++    meta_workspace_manager_is_workspace_active (workspace_manager,
++                                                old_global_workspace);
++
++  if (old_workspace == workspace)
++    return;  /* Already active on this monitor */
++
++  /* Update the hash table */
++  g_hash_table_replace (workspace_manager->monitor_active_workspaces,
++                        g_object_ref (monitor),
++                        workspace);
++
++  /* Update global active_workspace if this is the primary monitor */
++  context = meta_display_get_context (workspace_manager->display);
++  backend = meta_context_get_backend (context);
++  monitor_manager = meta_backend_get_monitor_manager (backend);
++  primary_monitor = meta_monitor_manager_get_primary_logical_monitor (monitor_manager);
++
++  if (monitor == primary_monitor || !workspace_manager->active_workspace)
++    {
++      workspace_manager->active_workspace = workspace;
++      if (old_global_workspace != workspace)
++        {
++          g_signal_emit (workspace_manager,
++                         workspace_manager_signals[ACTIVE_WORKSPACE_CHANGED],
++                         0);
++        }
++    }
++
++  if (old_workspace &&
++      old_workspace_was_active !=
++      meta_workspace_manager_is_workspace_active (workspace_manager,
++                                                  old_workspace))
++    g_object_notify (G_OBJECT (old_workspace), "active");
++
++  if (workspace_was_active !=
++      meta_workspace_manager_is_workspace_active (workspace_manager, workspace))
++    g_object_notify (G_OBJECT (workspace), "active");
++
++  if (old_global_workspace &&
++      old_global_workspace != old_workspace &&
++      old_global_workspace != workspace &&
++      old_global_workspace_was_active !=
++      meta_workspace_manager_is_workspace_active (workspace_manager,
++                                                  old_global_workspace))
++    g_object_notify (G_OBJECT (old_global_workspace), "active");
++
++  workspace_manager->switch_monitor_index = monitor->number;
++
++  /* Queue calc_showing for windows on both old and new workspaces */
++  if (old_workspace)
++    meta_workspace_queue_calc_showing (old_workspace);
++  meta_workspace_queue_calc_showing (workspace);
++
++  /* Emit the per-monitor workspace changed signal */
++  g_signal_emit (workspace_manager,
++                workspace_manager_signals[MONITOR_WORKSPACE_CHANGED],
++                0,
++                monitor,
++                old_workspace,
++                workspace);
++
++  if (old_workspace)
++    {
++      MetaCompositor *compositor =
++        meta_display_get_compositor (workspace_manager->display);
++      int from = meta_workspace_index (old_workspace);
++      int to = meta_workspace_index (workspace);
++      MetaMotionDirection direction = to >= from ? META_MOTION_RIGHT : META_MOTION_LEFT;
++
++      if (meta_prefs_get_dynamic_workspaces () &&
++          to == meta_workspace_manager_get_n_workspaces (workspace_manager) - 1)
++        meta_workspace_manager_append_new_workspace (workspace_manager, FALSE, timestamp);
++
++      meta_compositor_switch_workspace (compositor, old_workspace, workspace, direction);
++      meta_workspace_manager_workspace_switched (workspace_manager, from, to, direction);
++    }
++
++  meta_workspace_focus_default_window (workspace, NULL, timestamp);
++
++  if (!old_workspace && meta_prefs_get_dynamic_workspaces () &&
++      meta_workspace_index (workspace) ==
++      meta_workspace_manager_get_n_workspaces (workspace_manager) - 1)
++    meta_workspace_manager_append_new_workspace (workspace_manager, FALSE, timestamp);
++
++  meta_topic (META_DEBUG_WORKAREA,
++              "Activated workspace %d on monitor %p (was %d)",
++              meta_workspace_index (workspace),
++              monitor,
++              old_workspace ? meta_workspace_index (old_workspace) : -1);
++}
++
++/**
++ * meta_workspace_manager_get_active_workspace_for_monitor:
++ * @workspace_manager: a #MetaWorkspaceManager
++ * @monitor: the #MetaLogicalMonitor to query
++ *
++ * Gets the currently active workspace on the specified monitor.
++ *
++ * Return value: (transfer none) (nullable): the active workspace on @monitor,
++ *   or %NULL if no workspace is active on that monitor yet.
++ */
++MetaWorkspace *
++meta_workspace_manager_get_active_workspace_for_monitor (MetaWorkspaceManager *workspace_manager,
++                                                         MetaLogicalMonitor   *monitor)
++{
++  g_return_val_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager), NULL);
++  g_return_val_if_fail (monitor != NULL, NULL);
++
++  return g_hash_table_lookup (workspace_manager->monitor_active_workspaces,
++                             monitor);
++}
++
++/**
++ * meta_workspace_manager_get_active_workspace_for_monitor_index:
++ * @workspace_manager: a #MetaWorkspaceManager
++ * @monitor_index: logical monitor number
++ *
++ * Gets the active workspace for a monitor by its current logical monitor number.
++ *
++ * Returns: (transfer none) (nullable): the active workspace, if available
++ */
++MetaWorkspace *
++meta_workspace_manager_get_active_workspace_for_monitor_index (MetaWorkspaceManager *workspace_manager,
++                                                               int                   monitor_index)
++{
++  MetaContext *context;
++  MetaBackend *backend;
++  MetaMonitorManager *monitor_manager;
++  MetaLogicalMonitor *monitor;
++
++  g_return_val_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager), NULL);
++
++  context = meta_display_get_context (workspace_manager->display);
++  backend = meta_context_get_backend (context);
++  monitor_manager = meta_backend_get_monitor_manager (backend);
++  monitor = meta_monitor_manager_get_logical_monitor_from_number (monitor_manager,
++                                                                  monitor_index);
++  return monitor
++    ? meta_workspace_manager_get_active_workspace_for_monitor (workspace_manager, monitor)
++    : workspace_manager->active_workspace;
++}
++
++void
++meta_workspace_manager_activate_workspace_for_monitor_index (MetaWorkspaceManager *workspace_manager,
++                                                             MetaWorkspace        *workspace,
++                                                             int                   monitor_index,
++                                                             guint32               timestamp)
++{
++  MetaContext *context;
++  MetaBackend *backend;
++  MetaMonitorManager *monitor_manager;
++  MetaLogicalMonitor *monitor;
++
++  g_return_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager));
++  g_return_if_fail (META_IS_WORKSPACE (workspace));
++
++  context = meta_display_get_context (workspace_manager->display);
++  backend = meta_context_get_backend (context);
++  monitor_manager = meta_backend_get_monitor_manager (backend);
++  monitor = meta_monitor_manager_get_logical_monitor_from_number (monitor_manager,
++                                                                  monitor_index);
++  if (monitor)
++    meta_workspace_manager_activate_workspace_for_monitor (workspace_manager,
++                                                           workspace,
++                                                           monitor,
++                                                           timestamp);
++}
++
++int
++meta_workspace_manager_get_switch_monitor_index (MetaWorkspaceManager *workspace_manager)
++{
++  g_return_val_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager), -1);
++
++  return workspace_manager->switch_monitor_index;
++}
++
++/**
++ * meta_workspace_manager_get_monitors_for_workspace:
++ * @workspace_manager: a #MetaWorkspaceManager
++ * @workspace: the #MetaWorkspace to query
++ *
++ * Gets the list of monitors that currently have @workspace active.
++ *
++ * Return value: (transfer full) (element-type MetaLogicalMonitor): a list
++ *   of monitors showing @workspace. Free with g_list_free().
++ */
++GList *
++meta_workspace_manager_get_monitors_for_workspace (MetaWorkspaceManager *workspace_manager,
++                                                   MetaWorkspace        *workspace)
++{
++  GHashTableIter iter;
++  gpointer key, value;
++  GList *monitors = NULL;
++
++  g_return_val_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager), NULL);
++  g_return_val_if_fail (META_IS_WORKSPACE (workspace), NULL);
++
++  g_hash_table_iter_init (&iter, workspace_manager->monitor_active_workspaces);
++  while (g_hash_table_iter_next (&iter, &key, &value))
++    {
++      if (value == workspace)
++        monitors = g_list_prepend (monitors, key);
++    }
++
++  return monitors;
++}
++
++gboolean
++meta_workspace_manager_is_workspace_active (MetaWorkspaceManager *workspace_manager,
++                                            MetaWorkspace        *workspace)
++{
++  GHashTableIter iter;
++  gpointer value;
++
++  g_return_val_if_fail (META_IS_WORKSPACE_MANAGER (workspace_manager), FALSE);
++  g_return_val_if_fail (META_IS_WORKSPACE (workspace), FALSE);
++
++  if (workspace_manager->active_workspace == workspace)
++    return TRUE;
++
++  g_hash_table_iter_init (&iter, workspace_manager->monitor_active_workspaces);
++  while (g_hash_table_iter_next (&iter, NULL, &value))
++    {
++      if (value == workspace)
++        return TRUE;
++    }
++
++  return FALSE;
++}
+diff --git a/src/core/prefs.c b/src/core/prefs.c
+index dbbe72b2958af2c840c09d56cd30d21b61edbb1d..5b92c8f4a86820dcd1889bcfff61b1ca392717c2 100644
+--- a/src/core/prefs.c
++++ b/src/core/prefs.c
+@@ -59,6 +59,7 @@
+ 
+ #define KEY_OVERLAY_KEY "overlay-key"
+ #define KEY_WORKSPACES_ONLY_ON_PRIMARY "workspaces-only-on-primary"
++#define KEY_PER_MONITOR_WORKSPACES "per-monitor-workspaces"
+ #define KEY_LOCATE_POINTER "locate-pointer"
+ 
+ /* These are the different schemas we are keeping
+@@ -120,6 +121,7 @@ static MetaButtonLayout button_layout;
+ static char **workspace_names = NULL;
+ 
+ static gboolean workspaces_only_on_primary = FALSE;
++static gboolean per_monitor_workspaces = FALSE;
+ 
+ static char *iso_next_group_option = NULL;
+ 
+@@ -375,6 +377,13 @@ static MetaBoolPreference preferences_bool[] =
+       },
+       &workspaces_only_on_primary,
+     },
++    {
++      { "per-monitor-workspaces",
++        SCHEMA_MUTTER,
++        META_PREF_PER_MONITOR_WORKSPACES,
++      },
++      &per_monitor_workspaces,
++    },
+     {
+       { "auto-maximize",
+         SCHEMA_MUTTER,
+@@ -1671,6 +1680,9 @@ meta_preference_to_string (MetaPreference pref)
+     case META_PREF_WORKSPACES_ONLY_ON_PRIMARY:
+       return "WORKSPACES_ONLY_ON_PRIMARY";
+ 
++    case META_PREF_PER_MONITOR_WORKSPACES:
++      return "PER_MONITOR_WORKSPACES";
++
+     case META_PREF_DRAGGABLE_BORDER_WIDTH:
+       return "DRAGGABLE_BORDER_WIDTH";
+ 
+@@ -2155,6 +2167,12 @@ meta_prefs_get_workspaces_only_on_primary (void)
+   return workspaces_only_on_primary;
+ }
+ 
++gboolean
++meta_prefs_get_per_monitor_workspaces (void)
++{
++  return per_monitor_workspaces;
++}
++
+ int
+ meta_prefs_get_draggable_border_width (void)
+ {
+diff --git a/src/core/window.c b/src/core/window.c
+index d0126b1b2be20ab5732c188a4eb82b6b0e5e6691..ac81cb40c9c46eb8b6eb966da4a6877a348b9a36 100644
+--- a/src/core/window.c
++++ b/src/core/window.c
+@@ -83,6 +83,8 @@
+ #include "meta/meta-enum-types.h"
+ #include "meta/prefs.h"
+ 
++static MetaWorkspace *meta_window_get_active_workspace (MetaWindow *window);
++
+ #ifdef HAVE_X11_CLIENT
+ #include "meta/group.h"
+ #include "mtk/mtk-x11.h"
+@@ -748,7 +750,7 @@ maybe_leave_show_desktop_mode (MetaWindow *window)
+   MetaWorkspaceManager *workspace_manager = window->display->workspace_manager;
+   gboolean is_desktop_or_dock;
+ 
+-  if (!workspace_manager->active_workspace->showing_desktop)
++  if (!meta_window_get_active_workspace (window)->showing_desktop)
+     return;
+ 
+   /* If the window is a transient for the dock or desktop, don't
+@@ -1278,7 +1280,8 @@ meta_window_constructed (GObject *object)
+                       "Putting window %s on active workspace",
+                       window->desc);
+ 
+-          set_workspace_state (window, FALSE, workspace_manager->active_workspace);
++          set_workspace_state (window, FALSE,
++                               meta_window_get_active_workspace (window));
+         }
+ 
+       meta_window_update_struts (window);
+@@ -1480,7 +1483,7 @@ meta_window_unmanage (MetaWindow  *window,
+       meta_topic (META_DEBUG_FOCUS,
+                   "Focusing default window since we're unmanaging %s",
+                   window->desc);
+-      meta_workspace_focus_default_window (workspace_manager->active_workspace,
++      meta_workspace_focus_default_window (meta_window_get_active_workspace (window),
+                                            window,
+                                            timestamp);
+     }
+@@ -1725,6 +1728,27 @@ meta_window_should_show_on_workspace (MetaWindow    *window,
+           meta_window_showing_on_its_workspace (window));
+ }
+ 
++static MetaWorkspace *
++meta_window_get_active_workspace (MetaWindow *window)
++{
++  MetaWorkspaceManager *workspace_manager = window->display->workspace_manager;
++
++  if (meta_prefs_get_per_monitor_workspaces ())
++    {
++      MetaLogicalMonitor *monitor = meta_window_get_main_logical_monitor (window);
++      if (monitor)
++        {
++          MetaWorkspace *workspace =
++            meta_workspace_manager_get_active_workspace_for_monitor (workspace_manager,
++                                                                     monitor);
++          if (workspace)
++            return workspace;
++        }
++    }
++
++  return workspace_manager->active_workspace;
++}
++
+ /**
+  * meta_window_should_show:
+  *
+@@ -1737,10 +1761,8 @@ meta_window_should_show_on_workspace (MetaWindow    *window,
+ gboolean
+ meta_window_should_show (MetaWindow *window)
+ {
+-  MetaWorkspaceManager *workspace_manager = window->display->workspace_manager;
+-  MetaWorkspace *active_workspace = workspace_manager->active_workspace;
+-
+-  return meta_window_should_show_on_workspace (window, active_workspace);
++  return meta_window_should_show_on_workspace (window,
++                                               meta_window_get_active_workspace (window));
+ }
+ 
+ /**
+@@ -1774,10 +1796,8 @@ meta_window_should_be_showing_on_workspace (MetaWindow    *window,
+ gboolean
+ meta_window_should_be_showing (MetaWindow *window)
+ {
+-  MetaWorkspaceManager *workspace_manager = window->display->workspace_manager;
+-  MetaWorkspace *active_workspace = workspace_manager->active_workspace;
+-
+-  return meta_window_should_be_showing_on_workspace (window, active_workspace);
++  return meta_window_should_be_showing_on_workspace (window,
++                                                      meta_window_get_active_workspace (window));
+ }
+ 
+ void
+@@ -4871,7 +4891,6 @@ should_be_on_all_workspaces (MetaWindow *window)
+ void
+ meta_window_on_all_workspaces_changed (MetaWindow *window)
+ {
+-  MetaWorkspaceManager *workspace_manager = window->display->workspace_manager;
+   gboolean on_all_workspaces = should_be_on_all_workspaces (window);
+ 
+   if (window->on_all_workspaces == on_all_workspaces)
+@@ -4887,7 +4906,7 @@ meta_window_on_all_workspaces_changed (MetaWindow *window)
+     {
+       /* We're coming out of the sticky state. Put the window on
+        * the currently active workspace. */
+-      workspace = workspace_manager->active_workspace;
++      workspace = meta_window_get_active_workspace (window);
+     }
+ 
+   set_workspace_state (window, on_all_workspaces, workspace);
+diff --git a/src/core/workspace-private.h b/src/core/workspace-private.h
+index 83fc8ea749e925f2ad2d00c638cab25eaf4fd3c7..df4517b6c187a3b9084d2c9faf7d8ec61d38e5fe 100644
+--- a/src/core/workspace-private.h
++++ b/src/core/workspace-private.h
+@@ -102,4 +102,6 @@ MetaWindow * meta_workspace_get_default_focus_window_at_point (MetaWorkspace *wo
+                                                                int            root_y);
+ GList * meta_workspace_get_default_focus_candidates (MetaWorkspace *workspace);
+ 
++void meta_workspace_queue_calc_showing (MetaWorkspace *workspace);
++
+ void meta_workspace_index_changed (MetaWorkspace *workspace);
+diff --git a/src/core/workspace.c b/src/core/workspace.c
+index 0afb83cc7dbc04d46ab94d22c563f9b9a4a93af4..7462a4a95ddb851dded78463c3427962df07b68a 100644
+--- a/src/core/workspace.c
++++ b/src/core/workspace.c
+@@ -40,14 +40,16 @@
+ #include "backends/meta-backend-private.h"
+ #include "backends/meta-cursor-tracker-private.h"
+ #include "backends/meta-logical-monitor.h"
++#include "backends/meta-monitor-manager-private.h"
+ #include "cogl/cogl.h"
+ #include "compositor/compositor-private.h"
+ #include "core/boxes-private.h"
+ #include "core/meta-workspace-manager-private.h"
+ #include "core/workspace-private.h"
++#include "meta/meta-backend.h"
++#include "meta/meta-context.h"
+ #include "meta/prefs.h"
+ 
+-void meta_workspace_queue_calc_showing   (MetaWorkspace *workspace);
+ static void focus_ancestor_or_mru_window (MetaWorkspace *workspace,
+                                           MetaWindow    *not_this_one,
+                                           guint32        timestamp);
+@@ -160,7 +162,9 @@ meta_workspace_get_property (GObject      *object,
+       g_value_set_uint (value, meta_workspace_index (ws));
+       break;
+     case PROP_ACTIVE:
+-      g_value_set_boolean (value, ws->manager->active_workspace == ws);
++      g_value_set_boolean (value,
++                           meta_workspace_manager_is_workspace_active (ws->manager,
++                                                                      ws));
+       break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+@@ -691,11 +695,60 @@ meta_workspace_activate_with_focus (MetaWorkspace *workspace,
+                                               new_space, direction);
+ }
+ 
++/**
++ * meta_workspace_activate:
++ * @workspace: a #MetaWorkspace
++ * @timestamp: timestamp for activation
++ *
++ * Switches to @workspace. This uses per-monitor workspace activation,
++ * switching only on the monitor where the cursor is located (or primary
++ * monitor as fallback).
++ *
++ * For the traditional global workspace activation (affects all monitors),
++ * use meta_workspace_activate_with_focus() directly.
++ */
+ void
+ meta_workspace_activate (MetaWorkspace *workspace,
+                          guint32        timestamp)
+ {
+-  meta_workspace_activate_with_focus (workspace, NULL, timestamp);
++  MetaContext *context;
++  MetaBackend *backend;
++  MetaLogicalMonitor *current_monitor;
++  MetaMonitorManager *monitor_manager;
++
++  /* Check if per-monitor workspaces are enabled */
++  if (!meta_prefs_get_per_monitor_workspaces ())
++    {
++      /* Traditional global workspace activation */
++      meta_workspace_activate_with_focus (workspace, NULL, timestamp);
++      return;
++    }
++
++  /* Per-monitor workspace mode: determine which monitor to switch */
++  context = meta_display_get_context (workspace->display);
++  backend = meta_context_get_backend (context);
++  current_monitor = meta_backend_get_current_logical_monitor (backend);
++
++  /* Fallback to primary monitor if cursor position unavailable */
++  if (!current_monitor)
++    {
++      monitor_manager = meta_backend_get_monitor_manager (backend);
++      current_monitor = meta_monitor_manager_get_primary_logical_monitor (monitor_manager);
++    }
++
++  /* Use per-monitor activation if we have a valid monitor */
++  if (current_monitor)
++    {
++      meta_workspace_manager_activate_workspace_for_monitor (workspace->manager,
++                                                             workspace,
++                                                             current_monitor,
++                                                             timestamp);
++    }
++  else
++    {
++      /* Fallback to traditional global activation if no monitor found */
++      meta_workspace_activate_with_focus (workspace, NULL, timestamp);
++    }
+ }
+ 
+ int
+diff --git a/src/meson.build b/src/meson.build
+index 05df3bfd2818afc20e5c6d3be1e6212ffa6e9a51..1dda52011b0b8d7961cc146c55ee182145757084 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -119,6 +119,7 @@ if have_x11
+     x11_xcb_dep,
+     xcb_randr_dep,
+     xcb_res_dep,
++    xcb_util_dep,
+     xau_dep,
+     xtst_dep,
+   ]
+diff --git a/src/meta/meta-workspace-manager.h b/src/meta/meta-workspace-manager.h
+index 777447dcc370495cf22423e4f379a4bc17f23224..23dc2f35a217396e930258ab5d0630d770a7cb87 100644
+--- a/src/meta/meta-workspace-manager.h
++++ b/src/meta/meta-workspace-manager.h
+@@ -80,3 +80,16 @@ int meta_workspace_manager_get_layout_columns (MetaWorkspaceManager *workspace_m
+ 
+ META_EXPORT
+ int meta_workspace_manager_get_layout_rows (MetaWorkspaceManager *workspace_manager);
++
++META_EXPORT
++MetaWorkspace *meta_workspace_manager_get_active_workspace_for_monitor_index (MetaWorkspaceManager *workspace_manager,
++                                                                               int                   monitor_index);
++
++META_EXPORT
++void meta_workspace_manager_activate_workspace_for_monitor_index (MetaWorkspaceManager *workspace_manager,
++                                                                   MetaWorkspace        *workspace,
++                                                                   int                   monitor_index,
++                                                                   guint32               timestamp);
++
++META_EXPORT
++int meta_workspace_manager_get_switch_monitor_index (MetaWorkspaceManager *workspace_manager);
+diff --git a/src/meta/prefs.h b/src/meta/prefs.h
+index 1afc3dc2e43fec93153763c4d65168e0a589695c..51285051c8ad25daac99c0c991eeb676b6d09df9 100644
+--- a/src/meta/prefs.h
++++ b/src/meta/prefs.h
+@@ -59,6 +59,7 @@
+  * @META_PREF_EDGE_TILING: edge tiling
+  * @META_PREF_FORCE_FULLSCREEN: force fullscreen
+  * @META_PREF_WORKSPACES_ONLY_ON_PRIMARY: workspaces only on primary
++ * @META_PREF_PER_MONITOR_WORKSPACES: per-monitor workspaces
+  * @META_PREF_DRAGGABLE_BORDER_WIDTH: draggable border width
+  * @META_PREF_AUTO_MAXIMIZE: auto-maximize
+  * @META_PREF_CENTER_NEW_WINDOWS: center new windows
+@@ -97,6 +98,7 @@ typedef enum
+   META_PREF_EDGE_TILING,
+   META_PREF_FORCE_FULLSCREEN,
+   META_PREF_WORKSPACES_ONLY_ON_PRIMARY,
++  META_PREF_PER_MONITOR_WORKSPACES,
+   META_PREF_DRAGGABLE_BORDER_WIDTH,
+   META_PREF_AUTO_MAXIMIZE,
+   META_PREF_CENTER_NEW_WINDOWS,
+@@ -220,6 +222,9 @@ void meta_prefs_set_force_fullscreen (gboolean whether);
+ META_EXPORT
+ gboolean meta_prefs_get_workspaces_only_on_primary (void);
+ 
++META_EXPORT
++gboolean meta_prefs_get_per_monitor_workspaces (void);
++
+ META_EXPORT
+ int      meta_prefs_get_draggable_border_width (void);
+ 

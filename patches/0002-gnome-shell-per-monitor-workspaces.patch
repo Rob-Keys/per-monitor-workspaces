@@ -1,0 +1,98 @@
+diff --git a/js/ui/workspaceAnimation.js b/js/ui/workspaceAnimation.js
+index c83001496d091e7f70bc9522ada7f97e906eb853..9585ac73fee3f9546c772e030e2b526b4ee0a97a 100644
+--- a/js/ui/workspaceAnimation.js
++++ b/js/ui/workspaceAnimation.js
+@@ -174,7 +174,9 @@ export const MonitorGroup = GObject.registerClass({
+ 
+         const workspaceManager = global.workspace_manager;
+         const vertical = workspaceManager.layout_rows === -1;
+-        const activeWorkspace = workspaceManager.get_active_workspace();
++        const activeWorkspace = Meta.prefs_get_per_monitor_workspaces()
++            ? workspaceManager.get_active_workspace_for_monitor_index(monitor.index)
++            : workspaceManager.get_active_workspace();
+ 
+         let x = 0;
+         let y = 0;
+@@ -313,6 +315,7 @@ export class WorkspaceAnimationController {
+     constructor() {
+         this._movingWindow = null;
+         this._switchData = null;
++        this._gestureMonitorIndex = -1;
+ 
+         Main.overview.connect('showing', () => {
+             if (this._switchData) {
+@@ -357,11 +360,24 @@ export class WorkspaceAnimationController {
+         if (!workspaceIndices)
+             workspaceIndices = [...Array(nWorkspaces).keys()];
+ 
+-        const monitors = Meta.prefs_get_workspaces_only_on_primary()
+-            ? [Main.layoutManager.primaryMonitor] : Main.layoutManager.monitors;
++        let monitors;
++        if (Meta.prefs_get_per_monitor_workspaces()) {
++            const requestedMonitor = this._gestureMonitorIndex >= 0
++                ? this._gestureMonitorIndex
++                : workspaceManager.get_switch_monitor_index();
++            const monitor = Main.layoutManager.monitors.find(m => m.index === requestedMonitor)
++                ?? Main.layoutManager.primaryMonitor;
++            switchData.monitorIndex = monitor.index;
++            monitors = [monitor];
++        } else {
++            monitors = Meta.prefs_get_workspaces_only_on_primary()
++                ? [Main.layoutManager.primaryMonitor] : Main.layoutManager.monitors;
++            switchData.monitorIndex = Main.layoutManager.primaryIndex;
++        }
+ 
+         for (const monitor of monitors) {
+-            if (Meta.prefs_get_workspaces_only_on_primary() &&
++            if (!Meta.prefs_get_per_monitor_workspaces() &&
++                Meta.prefs_get_workspaces_only_on_primary() &&
+                 monitor.index !== Main.layoutManager.primaryIndex)
+                 continue;
+ 
+@@ -383,6 +399,7 @@ export class WorkspaceAnimationController {
+         switchData.monitors.forEach(m => m.destroy());
+ 
+         this.movingWindow = null;
++        this._gestureMonitorIndex = -1;
+     }
+ 
+     animateSwitch(from, to, direction, onComplete) {
+@@ -426,7 +443,7 @@ export class WorkspaceAnimationController {
+                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+             };
+ 
+-            if (monitorGroup.index === Main.layoutManager.primaryIndex) {
++            if (monitorGroup.index === this._switchData.monitorIndex) {
+                 params.onComplete = () => {
+                     this._finishWorkspaceSwitch(this._switchData);
+                     onComplete();
+@@ -447,10 +464,13 @@ export class WorkspaceAnimationController {
+     }
+ 
+     _switchWorkspaceBegin(tracker, monitor) {
+-        if (Meta.prefs_get_workspaces_only_on_primary() &&
++        if (!Meta.prefs_get_per_monitor_workspaces() &&
++            Meta.prefs_get_workspaces_only_on_primary() &&
+             monitor !== Main.layoutManager.primaryIndex)
+             return;
+ 
++        this._gestureMonitorIndex = monitor;
++
+         const workspaceManager = global.workspace_manager;
+         const horiz = workspaceManager.layout_rows !== -1;
+         tracker.orientation = horiz
+@@ -503,9 +523,12 @@ export class WorkspaceAnimationController {
+                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+             };
+ 
+-            if (monitorGroup.index === Main.layoutManager.primaryIndex) {
++            if (monitorGroup.index === switchData.monitorIndex) {
+                 params.onComplete = () => {
+-                    if (!newWs.active)
++                    if (Meta.prefs_get_per_monitor_workspaces())
++                        global.workspace_manager.activate_workspace_for_monitor_index(
++                            newWs, switchData.monitorIndex, endTime);
++                    else if (!newWs.active)
+                         newWs.activate(endTime);
+                     this._finishWorkspaceSwitch(switchData);
+                 };

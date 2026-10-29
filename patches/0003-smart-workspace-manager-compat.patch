@@ -1,0 +1,218 @@
+diff --git a/README.md b/README.md
+index 3de2281591bb934f47d90b38569a8469c41e85d3..8fd9a37224ad75f16fece3323a7e7bc0a4b850f8 100644
+--- a/README.md
++++ b/README.md
+@@ -56,22 +56,14 @@ Instead of all monitors switching workspaces together (GNOME's default behavior)
+ 
+ ## ⚙️ Required Setup
+ 
+-**Switch to Static Workspaces** (required for proper functionality):
++Dynamic workspaces are supported. Keep GNOME's dynamic workspace setting enabled:
+ 
+ ```bash
+-# Disable dynamic workspaces
+-gsettings set org.gnome.mutter dynamic-workspaces false
+-
+-# Set number of workspaces (adjust as needed)
+-gsettings set org.gnome.desktop.wm.preferences num-workspaces 4
+-
+-# Verify settings
++# Enable dynamic workspaces
++gsettings set org.gnome.mutter dynamic-workspaces true
+ gsettings get org.gnome.mutter dynamic-workspaces
+-gsettings get org.gnome.desktop.wm.preferences num-workspaces
+ ```
+ 
+-Or via **Settings** → **Multitasking** → **Workspaces** → **Fixed number of workspaces**
+-
+ ## 🎮 How It Works
+ 
+ ### The Smart Shifting Algorithm
+@@ -107,8 +99,7 @@ journalctl -f -o cat /usr/bin/gnome-shell
+ ```
+ 
+ ### Windows getting lost?
+-- Ensure you're using **static workspaces** (not dynamic)
+-- Check that you have enough workspaces configured (4-6 recommended)
++- Ensure dynamic workspaces are enabled
+ 
+ ### Delayed window movement?
+ - This is normal - the extension works by shifting windows after workspace changes
+@@ -181,4 +172,4 @@ MIT License - see [LICENSE](LICENSE) file for details.
+ | 43.x | ✅ | Tested |
+ | 44.x | ✅ | Tested |
+ | 45.x | ✅ | Tested |
+-| 46.x | 🧪 | Should work |
+\ No newline at end of file
++| 46.x | 🧪 | Should work |
+diff --git a/extension.js b/extension.js
+index 4f90d15d1a8cfc28f1d6777b48712f7fe4148d27..15dfeb7449efa96d8f0995649eaf0b97073e25d9 100644
+--- a/extension.js
++++ b/extension.js
+@@ -29,6 +29,15 @@ class SmartWorkspaceManager extends GObject.Object {
+     }
+     
+     _handleMonitorChange() {
++        // Mutter now owns per-monitor workspace visibility. The legacy window
++        // migration path would undo that native state and reintroduce flicker.
++        if (typeof Meta.prefs_get_per_monitor_workspaces === 'function' &&
++            Meta.prefs_get_per_monitor_workspaces()) {
++            console.log('Native per-monitor workspaces enabled; skipping window sync');
++            this._disableSync();
++            return;
++        }
++
+         const numMonitors = Main.layoutManager.monitors.length;
+         
+         console.log(`Monitor change detected: ${numMonitors} monitor(s) connected`);
+@@ -120,6 +129,12 @@ class SmartWorkspaceManager extends GObject.Object {
+     }
+     
+     _startTracking() {
++        if (typeof Meta.prefs_get_per_monitor_workspaces === 'function' &&
++            Meta.prefs_get_per_monitor_workspaces()) {
++            this._disableSync();
++            return;
++        }
++
+         if (!this._isActive) {
+             console.log('Sync disabled, not starting tracking');
+             return;
+@@ -214,13 +229,10 @@ class SmartWorkspaceManager extends GObject.Object {
+     _shiftMonitorWorkspaces(monitorIndex, direction, workspaceDiff) {
+         const workspaceManager = global.workspace_manager;
+         const numWorkspaces = workspaceManager.get_n_workspaces();
+-        
+-        console.log(`Shifting monitor ${monitorIndex + 1} workspaces ${direction} by ${workspaceDiff}`);
+-        console.log(`Total workspaces: ${numWorkspaces}`);
+-        
+-        // Collect all windows on this monitor across ALL workspaces
+-        const monitorWindowsByWorkspace = new Map();
+-        
++        const monitorWindowsByWorkspace = [];
++
++        // Keep workspace objects, rather than indexes: dynamic workspaces can
++        // be appended or reindexed while windows are moved.
+         for (let wsIndex = 0; wsIndex < numWorkspaces; wsIndex++) {
+             const workspace = workspaceManager.get_workspace_by_index(wsIndex);
+             if (!workspace) continue;
+@@ -236,57 +248,47 @@ class SmartWorkspaceManager extends GObject.Object {
+             });
+             
+             if (monitorWindows.length > 0) {
+-                monitorWindowsByWorkspace.set(wsIndex, monitorWindows);
++                monitorWindowsByWorkspace.push({ workspace, windows: monitorWindows });
+             }
+         }
+-        
+-        console.log(`Found windows on monitor ${monitorIndex + 1} across ${monitorWindowsByWorkspace.size} workspaces`);
+-        
+-        // Now shift all windows according to the direction
+-        monitorWindowsByWorkspace.forEach((windows, oldWorkspaceIndex) => {
+-            let newWorkspaceIndex;
+-            
+-            if (direction === 'right') {
+-                newWorkspaceIndex = oldWorkspaceIndex + workspaceDiff;
+-            } else {
+-                newWorkspaceIndex = oldWorkspaceIndex - workspaceDiff;
+-            }
+-            
+-            // Simple bounds checking
+-            if (newWorkspaceIndex < 0 || newWorkspaceIndex >= numWorkspaces) {
+-                console.log(`Target workspace ${newWorkspaceIndex + 1} out of bounds, skipping`);
+-                return;
+-            }
+-            
+-            // Skip if the new workspace is the same as old
+-            if (newWorkspaceIndex === oldWorkspaceIndex) {
+-                return;
+-            }
+-            
+-            const targetWorkspace = workspaceManager.get_workspace_by_index(newWorkspaceIndex);
+-            
+-            if (!targetWorkspace) {
+-                console.log(`Workspace ${newWorkspaceIndex + 1} doesn't exist, skipping`);
+-                return;
++
++        // On a rightward shift, move the highest occupied workspaces first.
++        // This lets GNOME's dynamic workspace policy create a new trailing
++        // workspace as soon as a window lands on the current last one. Moving
++        // low-to-high could otherwise make the next target disappear/reindex.
++        monitorWindowsByWorkspace.sort((a, b) => {
++            const delta = a.workspace.index() - b.workspace.index();
++            return direction === 'right' ? -delta : delta;
++        });
++
++        for (const { workspace, windows } of monitorWindowsByWorkspace) {
++            const oldIndex = workspace.index();
++            const newIndex = oldIndex + (direction === 'right' ? workspaceDiff : -workspaceDiff);
++            if (newIndex < 0) continue;
++
++            // Dynamic workspaces normally provide a trailing empty workspace.
++            // Append more only when a multi-workspace jump needs them.
++            while (workspaceManager.get_n_workspaces() <= newIndex) {
++                workspaceManager.append_new_workspace(false, global.get_current_time());
+             }
+-            
+-            console.log(`Moving ${windows.length} windows from workspace ${oldWorkspaceIndex + 1} → ${newWorkspaceIndex + 1}`);
+-            
+-            // Move all windows
+-            windows.forEach((window, index) => {
++            const targetWorkspace = workspaceManager.get_workspace_by_index(newIndex);
++            if (!targetWorkspace || targetWorkspace === workspace) continue;
++
++            for (let i = 0; i < windows.length; i++) {
++                const window = windows[i];
+                 const timeoutId = setTimeout(() => {
+                     try {
+                         window.change_workspace(targetWorkspace);
+-                        console.log(`Moved "${window.get_title()}" to workspace ${newWorkspaceIndex + 1}`);
+                     } catch (error) {
+-                        console.log(`Error moving window: ${error}`);
++                        console.error(`Smart Workspace Manager: could not move window: ${error}`);
++                    } finally {
++                        const timeoutIndex = this._windowMoveTimeouts.indexOf(timeoutId);
++                        if (timeoutIndex >= 0) this._windowMoveTimeouts.splice(timeoutIndex, 1);
+                     }
+-                }, index * 10);
+-                
+-                // Track timeout for cleanup
++                }, i * 10);
+                 this._windowMoveTimeouts.push(timeoutId);
+-            });
+-        });
++            }
++        }
+     }
+     
+     destroy() {
+@@ -338,4 +340,4 @@ class Extension {
+     }
+ }
+ 
+-export default Extension;
+\ No newline at end of file
++export default Extension;
+diff --git a/metadata.json b/metadata.json
+index 888da0225e9193d3840e25ba0dcffefbb409f029..c341792aebe2d3bafd58f6c17fa7deee8bf4b25e 100644
+--- a/metadata.json
++++ b/metadata.json
+@@ -1,8 +1,12 @@
+ {
+   "uuid": "smart-workspace-manager@local",
+-  "name": "Smart Workspace Manager", 
+-  "description": "Synchronizes workspace switching across multiple monitors based on mouse focus. When you switch workspaces on one monitor, windows on other monitors automatically shift to maintain workspace independence per monitor.",
+-  "version": 1,
+-  "shell-version": ["45", "46", "47"],
++  "name": "Smart Workspace Manager",
++  "description": "Simulates per-monitor workspace switching on GNOME, with support for dynamic workspaces.",
++  "version": 2,
++  "shell-version": [
++    "45",
++    "46",
++    "47"
++  ],
+   "url": "https://github.com/devops-dude-dinodam/smart-workspace-manager"
+-}
+\ No newline at end of file
++}

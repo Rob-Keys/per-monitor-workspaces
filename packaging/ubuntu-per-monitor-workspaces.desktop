@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Ubuntu (Per-Monitor Workspaces)
+Comment=Ubuntu Wayland with independent workspace switching on each display
+Exec=/usr/local/bin/gnome-shell-per-monitor-session
+TryExec=/opt/per-monitor-workspaces/usr/bin/gnome-shell
+Type=Application
+DesktopNames=ubuntu;GNOME;
+X-GDM-SessionRegisters=true
